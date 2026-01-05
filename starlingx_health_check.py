@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-StarlingX Cluster Health Check Script
-Monitors Wind River StarlingX cluster health including connectivity, storage, K8s, and applications
+Cloud Cluster Health Check Script
+Monitors Wind River Cloud cluster health including connectivity, storage, K8s, and applications
 
 Usage:
     python starlingx_health_check.py <host_ip> [username] [--key-path /path/to/key]
@@ -15,6 +15,8 @@ import subprocess
 import socket
 import json
 import sys
+import os
+import webbrowser
 from datetime import datetime
 from typing import Dict, List, Tuple
 import paramiko
@@ -24,9 +26,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import print as rprint
 
-class StarlingXHealthCheck:
+class CloudHealthCheck:
     """
-    Main health check class for StarlingX clusters
+    Main health check class for Cloud clusters
     Performs comprehensive health monitoring of distributed cloud systems
     """
     
@@ -35,7 +37,7 @@ class StarlingXHealthCheck:
         Initialize health checker with connection parameters
         
         Args:
-            host_ip: IP address of StarlingX system controller
+            host_ip: IP address of Cloud system controller
             username: SSH username (default: sysadmin)
             password: SSH password (prompted if not provided)
             key_path: Path to SSH private key (optional)
@@ -50,7 +52,7 @@ class StarlingXHealthCheck:
         
     def connect_ssh(self) -> bool:
         """
-        Establish SSH connection to the StarlingX host
+        Establish SSH connection to the Cloud host
         
         Returns:
             bool: True if connection successful, False otherwise
@@ -91,7 +93,7 @@ class StarlingXHealthCheck:
     
     def check_host_reachability(self) -> Dict:
         """
-        Check if the StarlingX host is reachable via ping and SSH
+        Check if the Cloud host is reachable via ping and SSH
         
         Returns:
             Dict with ping/ssh status and overall reachability
@@ -124,30 +126,64 @@ class StarlingXHealthCheck:
         """
         result = {'status': 'UNKNOWN', 'details': {}}
         
-        # Get overall Ceph cluster status in JSON format
-        stdout, stderr, code = self.execute_command('sudo ceph status --format json')
+        # Get Ceph health status
+        stdout, stderr, code = self.execute_command('ceph health')
         if code == 0:
-            try:
-                ceph_status = json.loads(stdout)
-                # Extract key health indicators
-                result['details']['cluster_status'] = ceph_status.get('health', {}).get('status', 'UNKNOWN')
-                result['details']['mon_status'] = len(ceph_status.get('monmap', {}).get('mons', []))
-                result['details']['osd_status'] = ceph_status.get('osdmap', {}).get('osdmap', {})
-            except:
-                result['details']['cluster_status'] = 'PARSE_ERROR'
+            result['details']['health'] = stdout.strip()
+            is_healthy = 'HEALTH_OK' in stdout
+        else:
+            result['details']['health'] = f'Command failed: {stderr.strip()}'
+            is_healthy = False
         
-        # Get detailed OSD (Object Storage Daemon) status
-        stdout, stderr, code = self.execute_command('sudo ceph osd status')
+        # Get overall Ceph status
+        stdout, stderr, code = self.execute_command('ceph status')
         if code == 0:
-            result['details']['osd_details'] = stdout.strip()
+            result['details']['status'] = stdout.strip()
+        else:
+            result['details']['status'] = f'Command failed: {stderr.strip()}'
         
-        # Get storage usage statistics
-        stdout, stderr, code = self.execute_command('sudo ceph df')
+        # Get monitor status
+        stdout, stderr, code = self.execute_command('ceph mon stat')
         if code == 0:
-            result['details']['storage_usage'] = stdout.strip()
+            result['details']['mon_stat'] = stdout.strip()
+        else:
+            result['details']['mon_stat'] = f'Command failed: {stderr.strip()}'
         
-        # Determine overall health: HEALTH_OK means everything is good
-        result['status'] = 'HEALTHY' if result['details'].get('cluster_status') == 'HEALTH_OK' else 'WARNING'
+        # Get storage usage
+        stdout, stderr, code = self.execute_command('ceph df')
+        if code == 0:
+            result['details']['df'] = stdout.strip()
+        else:
+            result['details']['df'] = f'Command failed: {stderr.strip()}'
+        
+        # Get OSD tree
+        stdout, stderr, code = self.execute_command('ceph osd tree')
+        if code == 0:
+            result['details']['osd_tree'] = stdout.strip()
+        else:
+            result['details']['osd_tree'] = f'Command failed: {stderr.strip()}'
+        
+        # Get OSD status
+        stdout, stderr, code = self.execute_command('ceph osd status')
+        if code == 0:
+            result['details']['osd_status'] = stdout.strip()
+        else:
+            result['details']['osd_status'] = f'Command failed: {stderr.strip()}'
+        
+        # Get placement group status
+        stdout, stderr, code = self.execute_command('ceph pg stat')
+        if code == 0:
+            result['details']['pg_stat'] = stdout.strip()
+        else:
+            result['details']['pg_stat'] = f'Command failed: {stderr.strip()}'
+        
+        # Check if Ceph is available at all
+        if 'Command failed' in result['details']['health']:
+            result['status'] = 'FAILED'
+            result['details']['note'] = 'Ceph may not be installed or accessible'
+        else:
+            result['status'] = 'HEALTHY' if is_healthy else 'WARNING'
+        
         return result
     
     def check_kubernetes_cluster(self) -> Dict:
@@ -186,7 +222,7 @@ class StarlingXHealthCheck:
         stdout, stderr, code = self.execute_command('kubectl get pods -n kube-system -o wide | grep -E "(Error|CrashLoopBackOff|Pending|ImagePullBackOff|ContainerCreating)"')
         result['details']['system_pod_issues'] = stdout.strip() if stdout.strip() else 'All system pods healthy'
         
-        # Check StarlingX platform pods in armada namespace
+        # Check Cloud platform pods in armada namespace
         stdout, stderr, code = self.execute_command('kubectl get pods -n armada -o wide')
         if code == 0:
             result['details']['platform_pods'] = stdout.strip()
@@ -203,11 +239,11 @@ class StarlingXHealthCheck:
     
     def check_starlingx_services(self) -> Dict:
         """
-        Check StarlingX platform services and applications
+        Check Cloud platform services and applications
         Identifies failed services, active alarms, and application issues
         
         Returns:
-            Dict with StarlingX service health details
+            Dict with Cloud service health details
         """
         result = {'status': 'UNKNOWN', 'details': {}}
         
@@ -323,18 +359,67 @@ class StarlingXHealthCheck:
         if code == 0:
             result['details']['memory'] = stdout.strip()
         
-        # Get disk usage for all mounted filesystems
-        stdout, stderr, code = self.execute_command('df -h')
-        if code == 0:
-            result['details']['disk_usage'] = stdout.strip()
+        # Check disk usage - only show partitions above 75%
+        stdout, stderr, code = self.execute_command("df -h | awk 'NR>1 {gsub(/%/, \"\", $5); if($5 > 75) print $0}'")
+        if code == 0 and stdout.strip():
+            result['details']['high_disk_usage'] = stdout.strip()
+            result['status'] = 'WARNING'
+        else:
+            result['details']['high_disk_usage'] = 'All partitions below 75% usage'
+            result['status'] = 'HEALTHY'
         
         # Get system load average (1, 5, 15 minute averages)
         stdout, stderr, code = self.execute_command('uptime')
         if code == 0:
             result['details']['load_average'] = stdout.strip()
         
-        # For now, assume resources are healthy (could add thresholds later)
-        result['status'] = 'HEALTHY'
+        return result
+    
+    def check_wind_river_analytics(self) -> Dict:
+        """
+        Check Wind River Analytics service status
+        Monitors analytics components and data collection
+        
+        Returns:
+            Dict with Wind River Analytics status details
+        """
+        result = {'status': 'UNKNOWN', 'details': {}}
+        
+        # Check if monitor namespace exists
+        stdout, stderr, code = self.execute_command('kubectl get namespace monitor')
+        if code == 0:
+            result['details']['monitor_namespace'] = 'Monitor namespace exists'
+            
+            # Get all pods in monitor namespace with detailed status
+            stdout, stderr, code = self.execute_command('kubectl get pods -n monitor -o wide')
+            if code == 0:
+                result['details']['monitor_pods'] = stdout.strip()
+                
+                # Check for unhealthy pods in monitor namespace
+                stdout, stderr, code = self.execute_command('kubectl get pods -n monitor --field-selector=status.phase!=Running,status.phase!=Succeeded')
+                if code == 0 and stdout.strip():
+                    result['details']['monitor_pod_issues'] = stdout.strip()
+                else:
+                    result['details']['monitor_pod_issues'] = 'All monitor pods healthy'
+                
+                # Get pod resource usage in monitor namespace
+                stdout, stderr, code = self.execute_command('kubectl top pods -n monitor --no-headers 2>/dev/null')
+                if code == 0 and stdout.strip():
+                    result['details']['monitor_pod_resources'] = stdout.strip()
+            
+            result['status'] = 'HEALTHY'
+        else:
+            result['details']['monitor_namespace'] = 'Monitor namespace not found - Wind River Analytics may not be installed'
+            
+            # Check analytics pods in analytics namespace as fallback
+            stdout, stderr, code = self.execute_command('kubectl get pods -n analytics -o wide')
+            if code == 0:
+                result['details']['analytics_pods'] = stdout.strip()
+                result['status'] = 'WARNING'
+            else:
+                result['details']['analytics_pods'] = 'Analytics namespace not found'
+                result['status'] = 'FAILED'
+        
         return result
     
     def check_network_connectivity(self) -> Dict:
@@ -347,23 +432,29 @@ class StarlingXHealthCheck:
         """
         result = {'status': 'UNKNOWN', 'details': {}}
         
-        # Get all network interfaces and their IP addresses
-        stdout, stderr, code = self.execute_command('ip addr show')
+        # Get primary network interfaces with IP addresses
+        stdout, stderr, code = self.execute_command('ip addr show | grep -A 3 -E "^[0-9]+: (eth|ens|enp|eno)" | grep -E "(^[0-9]+:|inet )"')
         if code == 0:
-            result['details']['interfaces'] = stdout.strip()
+            result['details']['primary_interfaces'] = stdout.strip()
+        
+        # Check for packet drops on network interfaces
+        stdout, stderr, code = self.execute_command('cat /proc/net/dev | awk "NR>2 && ($4>0 || $12>0) {print $1, \"RX drops:\", $4, \"TX drops:\", $12}"')
+        if code == 0 and stdout.strip():
+            result['details']['packet_drops'] = stdout.strip()
+        else:
+            result['details']['packet_drops'] = 'No packet drops detected'
         
         # Get routing table to verify network paths
         stdout, stderr, code = self.execute_command('ip route')
         if code == 0:
             result['details']['routes'] = stdout.strip()
         
-        # Network is assumed healthy if commands execute (could add connectivity tests)
         result['status'] = 'HEALTHY'
         return result
     
     def check_installed_software(self) -> Dict:
         """
-        Check installed Wind River StarlingX software versions
+        Check installed Wind River Cloud software versions
         Verifies platform packages and container runtime
         
         Returns:
@@ -371,22 +462,41 @@ class StarlingXHealthCheck:
         """
         result = {'status': 'UNKNOWN', 'details': {}}
         
-        # Get StarlingX build information and version
+        # Get Cloud build information and version
         stdout, stderr, code = self.execute_command('cat /etc/build.info')
         if code == 0:
             result['details']['build_info'] = stdout.strip()
         
-        # List all StarlingX and Wind River related packages
+        # List all Cloud and Wind River related packages
         stdout, stderr, code = self.execute_command('rpm -qa | grep -E "(wind|starling|platform)" | sort')
         if code == 0:
-            result['details']['starlingx_packages'] = stdout.strip()
+            result['details']['cloud_packages'] = stdout.strip()
         
         # Check container runtime version (Docker or Containerd)
         stdout, stderr, code = self.execute_command('docker version --format "{{.Server.Version}}" 2>/dev/null || containerd --version')
         if code == 0:
             result['details']['container_runtime'] = stdout.strip()
         
-        # Software check is informational, always healthy
+        # Get application list
+        stdout, stderr, code = self.execute_command('source /etc/platform/openrc && system application-list')
+        if code == 0:
+            result['details']['application_list'] = stdout.strip()
+        
+        # Get analytics application details
+        stdout, stderr, code = self.execute_command('source /etc/platform/openrc && system application-show wr-analytics')
+        if code == 0:
+            result['details']['analytics_app'] = stdout.strip()
+        
+        # Get system inventory
+        stdout, stderr, code = self.execute_command('source /etc/platform/openrc && system inventory-list')
+        if code == 0:
+            result['details']['inventory_list'] = stdout.strip()
+        
+        # Get non-running services
+        stdout, stderr, code = self.execute_command('systemctl list-units --type=service | grep -v running')
+        if code == 0:
+            result['details']['non_running_services'] = stdout.strip()
+        
         result['status'] = 'HEALTHY'
         return result
     
@@ -398,7 +508,7 @@ class StarlingXHealthCheck:
         Returns:
             Dict containing all health check results
         """
-        rprint(f"[bold blue]Starting StarlingX Health Check for {self.host_ip}[/bold blue]")
+        rprint(f"[bold blue]Starting Cloud Health Check for {self.host_ip}[/bold blue]")
         rprint(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         
         # Define all health check modules to run
@@ -406,10 +516,11 @@ class StarlingXHealthCheck:
             ("Host Reachability", self.check_host_reachability),      # Basic connectivity
             ("Ceph Storage", self.check_ceph_storage),                # Storage cluster health
             ("Kubernetes Cluster", self.check_kubernetes_cluster),    # K8s and pod health
-            ("StarlingX Services", self.check_starlingx_services),    # Platform services
+            ("Cloud Services", self.check_starlingx_services),        # Platform services
             ("Subclouds", self.check_subclouds),                      # Distributed cloud
             ("System Resources", self.check_system_resources),        # CPU/Memory/Disk
             ("Network Connectivity", self.check_network_connectivity), # Network config
+            ("Wind River Analytics", self.check_wind_river_analytics), # Analytics status
             ("Installed Software", self.check_installed_software),    # Software versions
         ]
         
@@ -425,7 +536,7 @@ class StarlingXHealthCheck:
         Display health check results in a formatted table
         Shows component status with color coding and summary
         """
-        table = Table(title="StarlingX Cluster Health Check Results")
+        table = Table(title="Cloud Cluster Health Check Results")
         table.add_column("Component", style="cyan", no_wrap=True)
         table.add_column("Status", style="magenta")
         table.add_column("Details", style="green")
@@ -466,9 +577,9 @@ class StarlingXHealthCheck:
         summary_color = 'green' if healthy == total else 'yellow' if healthy > total/2 else 'red'
         self.console.print(f"\n[{summary_color}]Summary: {healthy}/{total} components healthy[/{summary_color}]")
     
-    def save_report(self, filename: str = None):
+    def save_html_report(self, filename: str = None):
         """
-        Save detailed health check report to JSON file
+        Save detailed health check report to HTML file in Downloads directory
         Creates timestamped report with all collected data
         
         Args:
@@ -476,20 +587,110 @@ class StarlingXHealthCheck:
         """
         if not filename:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"C:\\Users\\mshokr\\Documents\\code\\health_check\\starlingx_health_report_{timestamp}.json"
+            downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
+            filename = os.path.join(downloads_path, f"cloud_health_report_{timestamp}.html")
         
-        # Create comprehensive report structure
-        report = {
-            'timestamp': datetime.now().isoformat(),
-            'host': self.host_ip,
-            'results': self.results
-        }
+        # Generate HTML report
+        html_content = self._generate_html_report()
         
         # Write report to file
-        with open(filename, 'w') as f:
-            json.dump(report, f, indent=2)
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
         
-        rprint(f"[green]Report saved to: {filename}[/green]")
+        rprint(f"[green]HTML Report saved to: {filename}[/green]")
+        
+        # Open the HTML file in default browser
+        webbrowser.open(f'file://{filename}')
+        return filename
+    
+    def _generate_html_report(self) -> str:
+        """
+        Generate HTML content for the health check report
+        
+        Returns:
+            String containing complete HTML report
+        """
+        status_colors = {
+            'HEALTHY': '#28a745',
+            'WARNING': '#ffc107', 
+            'FAILED': '#dc3545',
+            'UNKNOWN': '#6c757d'
+        }
+        
+        status_icons = {
+            'HEALTHY': '✓',
+            'WARNING': '⚠',
+            'FAILED': '✗',
+            'UNKNOWN': '?'
+        }
+        
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cloud Health Check Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f8f9fa; }}
+        .header {{ background: linear-gradient(135deg, #007bff, #0056b3); color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
+        .summary {{ background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .component {{ background: white; margin: 10px 0; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .status {{ font-weight: bold; padding: 5px 10px; border-radius: 4px; color: white; }}
+        .details {{ margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px; font-family: monospace; white-space: pre-wrap; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+        th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #f2f2f2; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Cloud Health Check Report</h1>
+        <p>Host: {self.host_ip}</p>
+        <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    </div>
+"""
+        
+        # Add summary
+        healthy = sum(1 for r in self.results.values() if r.get('status') == 'HEALTHY')
+        total = len(self.results)
+        summary_color = '#28a745' if healthy == total else '#ffc107' if healthy > total/2 else '#dc3545'
+        
+        html += f"""
+    <div class="summary">
+        <h2>Summary</h2>
+        <p style="color: {summary_color}; font-size: 18px; font-weight: bold;">
+            {healthy}/{total} components healthy
+        </p>
+    </div>
+"""
+        
+        # Add component details
+        for component, data in self.results.items():
+            status = data.get('status', 'UNKNOWN')
+            color = status_colors.get(status, '#6c757d')
+            icon = status_icons.get(status, '?')
+            
+            html += f"""
+    <div class="component">
+        <h3>{component.replace('_', ' ').title()}</h3>
+        <span class="status" style="background-color: {color};">{icon} {status}</span>
+        <div class="details">
+"""
+            
+            details = data.get('details', {})
+            if isinstance(details, dict):
+                for key, value in details.items():
+                    if isinstance(value, str):
+                        html += f"<strong>{key.replace('_', ' ').title()}:</strong>\n{value}\n\n"
+            else:
+                html += str(details)
+            
+            html += "</div></div>"
+        
+        html += """
+</body>
+</html>
+"""
+        return html
     
     def cleanup(self):
         """
@@ -527,13 +728,13 @@ def main():
         password = getpass.getpass(f"Enter password for {username}@{host_ip}: ")
     
     # Create and run health checker
-    health_checker = StarlingXHealthCheck(host_ip, username, password, key_path)
+    health_checker = CloudHealthCheck(host_ip, username, password, key_path)
     
     try:
         # Execute the complete health check sequence
         health_checker.run_health_check()
         health_checker.display_results()
-        health_checker.save_report()
+        health_checker.save_html_report()
     except KeyboardInterrupt:
         print("\nHealth check interrupted by user")
     except Exception as e:
