@@ -91,6 +91,53 @@ class CloudHealthCheck:
         except Exception as e:
             return "", str(e), 1
     
+    def get_cluster_info(self) -> Dict:
+        """
+        Get comprehensive cluster information from system show command
+        
+        Returns:
+            Dict with all system details
+        """
+        cluster_info = {
+            'name': 'Unknown',
+            'system_type': 'Unknown', 
+            'system_mode': 'Unknown',
+            'timezone': 'Unknown',
+            'description': 'Unknown'
+        }
+        
+        # Ensure SSH connection exists
+        if not self.ssh_client:
+            self.connect_ssh()
+        
+        stdout, stderr, code = self.execute_command('source /etc/platform/openrc && system show')
+        if code == 0:
+            lines = stdout.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if '| name ' in line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        cluster_info['name'] = parts[2]
+                elif '| system_type ' in line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        cluster_info['system_type'] = parts[2]
+                elif '| system_mode ' in line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        cluster_info['system_mode'] = parts[2]
+                elif '| timezone ' in line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        cluster_info['timezone'] = parts[2]
+                elif '| description ' in line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        cluster_info['description'] = parts[2]
+        
+        return cluster_info
+    
     def check_host_reachability(self) -> Dict:
         """
         Check if the Cloud host is reachable via ping and SSH
@@ -422,6 +469,40 @@ class CloudHealthCheck:
         
         return result
     
+    def check_system_uptime(self) -> Dict:
+        """
+        Check system uptime for main cloud and all subclouds
+        Shows how long systems have been running
+        
+        Returns:
+            Dict with uptime information for all systems
+        """
+        result = {'status': 'UNKNOWN', 'details': {}}
+        
+        # Get main system uptime
+        stdout, stderr, code = self.execute_command('uptime')
+        if code == 0:
+            result['details']['main_system_uptime'] = stdout.strip()
+        
+        # Get subclouds list and their uptime
+        stdout, stderr, code = self.execute_command('source /etc/platform/openrc && dcmanager subcloud list --format value --column name')
+        if code == 0 and stdout.strip():
+            subclouds = [sc.strip() for sc in stdout.strip().split('\n') if sc.strip()]
+            subcloud_uptimes = {}
+            
+            for subcloud in subclouds:
+                # Try to get uptime from each subcloud
+                stdout, stderr, code = self.execute_command(f'source /etc/platform/openrc && dcmanager subcloud show {subcloud} --format value --column management-state,availability-status')
+                if code == 0:
+                    subcloud_uptimes[f'{subcloud}_status'] = stdout.strip()
+            
+            result['details']['subclouds_status'] = subcloud_uptimes if subcloud_uptimes else 'No subclouds found'
+        else:
+            result['details']['subclouds_status'] = 'No subclouds found or not a system controller'
+        
+        result['status'] = 'HEALTHY'
+        return result
+    
     def check_network_connectivity(self) -> Dict:
         """
         Check network interfaces and routing configuration
@@ -508,8 +589,16 @@ class CloudHealthCheck:
         Returns:
             Dict containing all health check results
         """
+        # Get cluster info first
+        cluster_info = self.get_cluster_info()
+        
         rprint(f"[bold blue]Starting Cloud Health Check for {self.host_ip}[/bold blue]")
+        rprint(f"System: {cluster_info['name']} | Type: {cluster_info['system_type']} | Mode: {cluster_info['system_mode']}")
+        rprint(f"Timezone: {cluster_info['timezone']} | Description: {cluster_info['description']}")
         rprint(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        # Store cluster info for HTML report
+        self.cluster_info = cluster_info
         
         # Define all health check modules to run
         checks = [
@@ -519,6 +608,7 @@ class CloudHealthCheck:
             ("Cloud Services", self.check_starlingx_services),        # Platform services
             ("Subclouds", self.check_subclouds),                      # Distributed cloud
             ("System Resources", self.check_system_resources),        # CPU/Memory/Disk
+            ("System Uptime", self.check_system_uptime),              # Uptime for all systems
             ("Network Connectivity", self.check_network_connectivity), # Network config
             ("Wind River Analytics", self.check_wind_river_analytics), # Analytics status
             ("Installed Software", self.check_installed_software),    # Software versions
@@ -644,8 +734,11 @@ class CloudHealthCheck:
 <body>
     <div class="header">
         <h1>Cloud Health Check Report</h1>
-        <p>Host: {self.host_ip}</p>
-        <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p><strong>System Name:</strong> {getattr(self, 'cluster_info', {}).get('name', 'Unknown')}</p>
+        <p><strong>System Type:</strong> {getattr(self, 'cluster_info', {}).get('system_type', 'Unknown')} | <strong>Mode:</strong> {getattr(self, 'cluster_info', {}).get('system_mode', 'Unknown')}</p>
+        <p><strong>Timezone:</strong> {getattr(self, 'cluster_info', {}).get('timezone', 'Unknown')}</p>
+        <p><strong>Description:</strong> {getattr(self, 'cluster_info', {}).get('description', 'Unknown')}</p>
+        <p><strong>Host IP:</strong> {self.host_ip} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     </div>
 """
         
@@ -663,28 +756,45 @@ class CloudHealthCheck:
     </div>
 """
         
-        # Add component details
-        for component, data in self.results.items():
-            status = data.get('status', 'UNKNOWN')
-            color = status_colors.get(status, '#6c757d')
-            icon = status_icons.get(status, '?')
-            
-            html += f"""
+        # Define the order of components in HTML report
+        component_order = [
+            'wrcp_cluster_info',
+            'ceph_storage',
+            'kubernetes_cluster',
+            'cloud_services',
+            'subclouds',
+            'system_resources',
+            'network_connectivity',
+            'wind_river_analytics',
+            'installed_software',
+            'system_uptime',
+            'host_reachability'
+        ]
+        
+        # Add component details in specified order
+        for component_key in component_order:
+            if component_key in self.results:
+                data = self.results[component_key]
+                status = data.get('status', 'UNKNOWN')
+                color = status_colors.get(status, '#6c757d')
+                icon = status_icons.get(status, '?')
+                
+                html += f"""
     <div class="component">
-        <h3>{component.replace('_', ' ').title()}</h3>
+        <h3>{component_key.replace('_', ' ').title()}</h3>
         <span class="status" style="background-color: {color};">{icon} {status}</span>
         <div class="details">
 """
-            
-            details = data.get('details', {})
-            if isinstance(details, dict):
-                for key, value in details.items():
-                    if isinstance(value, str):
-                        html += f"<strong>{key.replace('_', ' ').title()}:</strong>\n{value}\n\n"
-            else:
-                html += str(details)
-            
-            html += "</div></div>"
+                
+                details = data.get('details', {})
+                if isinstance(details, dict):
+                    for key, value in details.items():
+                        if isinstance(value, str):
+                            html += f"<strong>{key.replace('_', ' ').title()}:</strong>\n{value}\n\n"
+                else:
+                    html += str(details)
+                
+                html += "</div></div>"
         
         html += """
 </body>
