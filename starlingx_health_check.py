@@ -552,12 +552,9 @@ class CloudHealthCheck:
             # System Controller License Info
             if 'system_controller' in license_data:
                 sc_info = license_data['system_controller']
-                result['details']['issued_for_host'] = sc_info.get('issued_for_host', 'Unknown')
                 result['details']['license_number'] = sc_info.get('license_number', 'Unknown')
                 result['details']['issued_date'] = sc_info.get('issued_date', 'Unknown')
                 result['details']['expiry_date'] = sc_info.get('expiry_date', 'Unknown')
-                result['details']['start_date'] = sc_info.get('start_date', 'Unknown')
-                result['details']['serial_number'] = sc_info.get('serial_number', 'Unknown')
                 result['details']['raw_license_content'] = sc_info.get('raw_output', '').replace('# Wind River Product Activation File (install.txt)\n', '').replace('# Issued for host:', '')
             
             # Subcloud Information
