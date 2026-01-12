@@ -533,6 +533,101 @@ class CloudHealthCheck:
         result['status'] = 'HEALTHY'
         return result
     
+    def check_license_usage(self) -> Dict:
+        """
+        Check license usage for system controller and all subclouds
+        Retrieves license information and host counts
+        
+        Returns:
+            Dict with license details and host allocation counts
+        """
+        result = {'status': 'HEALTHY', 'details': {}}
+        
+        # Read license data from JSON file
+        try:
+            import json
+            with open('C:\\Users\\mshokr\\Documents\\code\\get_lic\\wrcp_licenses.json', 'r') as f:
+                license_data = json.load(f)
+            
+            # System Controller License Info
+            if 'system_controller' in license_data:
+                sc_info = license_data['system_controller']
+                result['details']['issued_for_host'] = sc_info.get('issued_for_host', 'Unknown')
+                result['details']['license_number'] = sc_info.get('license_number', 'Unknown')
+                result['details']['issued_date'] = sc_info.get('issued_date', 'Unknown')
+                result['details']['expiry_date'] = sc_info.get('expiry_date', 'Unknown')
+                result['details']['start_date'] = sc_info.get('start_date', 'Unknown')
+                result['details']['serial_number'] = sc_info.get('serial_number', 'Unknown')
+                result['details']['raw_license_content'] = sc_info.get('raw_output', '').replace('# Wind River Product Activation File (install.txt)\n', '').replace('# Issued for host:', '')
+            
+            # Subcloud Information
+            subclouds = {k: v for k, v in license_data.items() if k != 'system_controller'}
+            if subclouds:
+                result['details']['subclouds'] = subclouds
+                result['details']['subcloud_count'] = len(subclouds)
+            
+            result['details']['total_systems'] = 1 + len(subclouds)
+            
+        except Exception as e:
+            result['details']['error'] = f'Failed to read license file: {str(e)}'
+        
+        return result
+    
+    def _parse_install_txt(self, content: str) -> Dict:
+        """
+        Parse Wind River Product Activation File (install.txt)
+        
+        Args:
+            content: Content of install.txt file
+            
+        Returns:
+            Dict with parsed license details
+        """
+        license_info = {}
+        lines = content.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if ':' in line:
+                key, value = line.split(':', 1)
+                license_info[key.strip()] = value.strip()
+        
+        return license_info
+    
+    def _parse_license_info(self, license_output: str) -> Dict:
+        """
+        Parse license information from system license-show output
+        
+        Args:
+            license_output: Raw output from system license-show command
+            
+        Returns:
+            Dict with parsed license details
+        """
+        license_info = {
+            'issued_for_host': 'Unknown',
+            'license_numbers': 'Unknown', 
+            'issued_date': 'Unknown'
+        }
+        
+        lines = license_output.split('\n')
+        for line in lines:
+            line = line.strip()
+            if '| issued_for_host ' in line and '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    license_info['issued_for_host'] = parts[2]
+            elif '| license_number ' in line and '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    license_info['license_numbers'] = parts[2]
+            elif '| issued_date ' in line and '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    license_info['issued_date'] = parts[2]
+        
+        return license_info
+    
     def check_installed_software(self) -> Dict:
         """
         Check installed Wind River Cloud software versions
@@ -607,6 +702,7 @@ class CloudHealthCheck:
             ("Kubernetes Cluster", self.check_kubernetes_cluster),    # K8s and pod health
             ("Cloud Services", self.check_starlingx_services),        # Platform services
             ("Subclouds", self.check_subclouds),                      # Distributed cloud
+            ("License Usage", self.check_license_usage),              # License information
             ("System Resources", self.check_system_resources),        # CPU/Memory/Disk
             ("System Uptime", self.check_system_uptime),              # Uptime for all systems
             ("Network Connectivity", self.check_network_connectivity), # Network config
@@ -646,7 +742,10 @@ class CloudHealthCheck:
             
             # Format details for display (truncate if too long)
             details = data.get('details', {})
-            if isinstance(details, dict):
+            if component == 'license_usage' and 'system_controller' in details:
+                sc_info = details['system_controller']
+                detail_str = f"Issued for host: {sc_info.get('issued_for_host', 'Unknown')}\nLicense number(s): {sc_info.get('license_numbers', 'Unknown')}\nIssued date: {sc_info.get('issued_date', 'Unknown')}"
+            elif isinstance(details, dict):
                 detail_str = '\n'.join([f"{k}: {v}" for k, v in details.items() if isinstance(v, str)])[:100]
             else:
                 detail_str = str(details)[:100]
@@ -763,6 +862,7 @@ class CloudHealthCheck:
             'kubernetes_cluster',
             'cloud_services',
             'subclouds',
+            'license_usage',
             'system_resources',
             'network_connectivity',
             'wind_river_analytics',
